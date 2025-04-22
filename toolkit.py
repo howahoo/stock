@@ -6,6 +6,8 @@ http://30daydo.com
 Contact: weigesysu@qq.com
 '''
 import codecs
+import os
+import pandas as pd
 
 class Toolkit():
     @staticmethod
@@ -37,18 +39,23 @@ class Toolkit():
         return account
 
     @staticmethod
-    def read_stock(cfg_file):
-        result=[]
+    def read_stock(filename):
         try:
-
-            f=open(cfg_file,'r').readlines()
-            for i in f:
-                i=i.strip()
-                if len(i)!=6:
-                    continue
-                result.append(i)
-                #print(i)
+            df = pd.read_csv(filename)
+            return df
         except Exception as e:
-            print(e)
+            print(f"读取文件失败: {str(e)}")
             return None
-        return result
+
+    @staticmethod
+    def save_stock(filename, data):
+        try:
+            if isinstance(data, pd.DataFrame):
+                data.to_csv(filename, index=False)
+            else:
+                df = pd.DataFrame(data)
+                df.to_csv(filename, index=False)
+            return True
+        except Exception as e:
+            print(f"保存文件失败: {str(e)}")
+            return False

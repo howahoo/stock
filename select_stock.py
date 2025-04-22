@@ -7,47 +7,191 @@ Contact: weigesysu@qq.com
 '''
 import tushare as ts
 import pandas as pd
-import os, datetime, time, Queue
+import os, datetime, time
+import numpy as np
+try:
+    # Python 2
+    import Queue
+except ImportError:
+    # Python 3
+    import queue as Queue
 from toolkit import Toolkit
 from threading import Thread
 
 q = Queue.Queue()
 
 # 用来选股用的
-pd.set_option('max_rows', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
 
-from configure.settings import get_engine
-engine = get_engine('db_stock')
+from configure.settings import DBSelector, config
+db_selector = DBSelector()
+engine = db_selector.get_engine('db_stock', type_='local')
+
+# 设置tushare pro的token
+ts.set_token(config.get('ts_token'))
+pro = ts.pro_api()
+
 # 缺陷： 暂时不能保存为excel
 class filter_stock():
     def __init__(self,retry=5,local=False):
         if local:
             for i in range(retry):
                 try:
-                    self.bases_save = ts.get_stock_basics()
-                    # print(self.bases_save)
-                    self.bases_save=self.bases_save.reset_index()
+                    # 使用pro接口获取股票基本信息
+                    self.bases_save = pro.stock_basic(exchange='', list_status='L', 
+                                                    fields='ts_code,symbol,name,area,industry,list_date')
+                    # 转换代码格式
+                    self.bases_save['code'] = self.bases_save['symbol']
                     self.bases_save.to_csv('bases.csv')
                     self.bases_save.to_sql('bases',engine,if_exists='replace')
-                    if self.bases_save:
+                    if not self.bases_save.empty:
                         break
-                
                 except Exception as e:
+                    print(f"获取数据失败: {str(e)}")
                     if i>=4:
                         self.bases_save=pd.DataFrame()
-                        exit()                        
-                    continue                  
-        
+                        exit()
+                    continue
         else:
             self.bases_save = pd.read_sql('bases',engine,index_col='index')
-            self.base=self.bases_save
+            self.base = self.bases_save
 
-        # 因为网速问题，手动从本地抓取
         self.today = time.strftime("%Y-%m-%d", time.localtime())
-        # self.base = pd.read_csv('bases.csv', dtype={'code': np.str})
-        self.all_code = self.base['code'].values
+        self.all_code = self.bases_save['code'].values
         self.working_count = 0
         self.mystocklist = Toolkit.read_stock('mystock.csv')
+
+    def get_stock_basics(self):
+        """获取所有股票的基本面数据"""
+        try:
+            # 获取基本面数据
+            df = pro.daily_basic(trade_date=self.today.replace('-', ''),
+                               fields='ts_code,turnover_rate,volume_ratio,pe,pb')
+            return df
+        except Exception as e:
+            print(f"获取基本面数据失败: {str(e)}")
+            return pd.DataFrame()
+
+    def get_area(self, area, writeable=False):
+        """获取特定地区的股票"""
+        user_area = self.bases_save[self.bases_save['area'] == area]
+        if writeable:
+            filename = area + '.csv'
+            user_area.to_csv(filename)
+        return user_area
+
+    def fetch_new_ipo(self, start_date, writeable=False):
+        """获取新股信息"""
+        try:
+            # 使用pro接口获取IPO股票信息
+            df = pro.new_share(start_date=start_date)
+            if writeable:
+                df.to_csv("New_IPO.csv")
+            return df
+        except Exception as e:
+            print(f"获取新股数据失败: {str(e)}")
+            return pd.DataFrame()
+
+    def get_daily_data(self, code, start_date=None, end_date=None):
+        """获取日线数据"""
+        try:
+            # 转换代码格式
+            if len(code) == 6:
+                if code.startswith('6'):
+                    ts_code = code + '.SH'
+                else:
+                    ts_code = code + '.SZ'
+            else:
+                ts_code = code
+            
+            if start_date is None:
+                start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime('%Y%m%d')
+            if end_date is None:
+                end_date = datetime.datetime.now().strftime('%Y%m%d')
+                
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            return df
+        except Exception as e:
+            print(f"获取日线数据失败: {str(e)}")
+            return pd.DataFrame()
+
+    def select_by_basics(self, pe_range=(0, 50), pb_range=(0, 5), 
+                        turnover_min=1.0, volume_ratio_min=1.0):
+        """根据基本面数据筛选股票"""
+        try:
+            # 获取基本面数据
+            df = self.get_stock_basics()
+            if df.empty:
+                return []
+            
+            # 条件筛选
+            condition = (
+                (df['pe'] >= pe_range[0]) & (df['pe'] <= pe_range[1]) &  # PE范围
+                (df['pb'] >= pb_range[0]) & (df['pb'] <= pb_range[1]) &  # PB范围
+                (df['turnover_rate'] >= turnover_min) &  # 换手率
+                (df['volume_ratio'] >= volume_ratio_min)  # 量比
+            )
+            
+            selected = df[condition]
+            
+            # 获取股票名称并组织结果
+            result = []
+            for _, row in selected.iterrows():
+                code = row['ts_code'][:6]
+                try:
+                    name = self.bases_save[self.bases_save['code'] == code]['name'].values[0]
+                    result.append([code, name, row['pe'], row['pb'], 
+                                 row['turnover_rate'], row['volume_ratio']])
+                except:
+                    continue
+            
+            return result
+            
+        except Exception as e:
+            print(f"基本面选股失败: {str(e)}")
+            return []
+
+    def macd(self, days=30):
+        """获取MACD指标"""
+        result = []
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime('%Y%m%d')
+        end_date = datetime.datetime.now().strftime('%Y%m%d')
+        
+        for code in self.all_code:
+            print(f"处理股票: {code}")
+            try:
+                df = self.get_daily_data(code, start_date, end_date)
+                if df.empty:
+                    continue
+                    
+                # 计算MA5和MA10
+                df['ma5'] = df['close'].rolling(window=5).mean()
+                df['ma10'] = df['close'].rolling(window=10).mean()
+                
+                # 计算MACD
+                exp12 = df['close'].ewm(span=12, adjust=False).mean()
+                exp26 = df['close'].ewm(span=26, adjust=False).mean()
+                df['macd'] = exp12 - exp26
+                df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+                df['hist'] = df['macd'] - df['signal']
+                
+                # 获取最新的值
+                latest = df.iloc[0]
+                
+                # 同时满足：
+                # 1. 5日均线上穿10日均线
+                # 2. MACD柱状图由负转正
+                if (latest['ma5'] > latest['ma10'] and 
+                    latest['hist'] > 0 and df.iloc[1]['hist'] < 0):
+                    stock_name = self.bases_save[self.bases_save['code'] == code]['name'].values[0]
+                    result.append([code, stock_name])
+                    print(f"选中: {code} {stock_name}")
+            except Exception as e:
+                print(f"处理股票{code}时出错: {str(e)}")
+                continue
+                
+        return result
 
     # 保存为excel 文件 这个时候csv 乱码,excel正常.
     def save_data_excel(self):
@@ -80,15 +224,6 @@ class filter_stock():
         if writeable:
             count.to_csv('各省的上市公司数目.csv')
         return count
-
-    # 显示你要的某个省的上市公司
-    def get_area(self, area, writeable=False):
-        user_area = self.base[self.base['area'] == area]
-        user_area.sort_values('timeToMarket', inplace=True, ascending=False)
-        if writeable:
-            filename = area + '.csv'
-            user_area.to_csv(filename)
-        return user_area
 
     # 获取所有地区的分类个股
     def get_all_location(self):
@@ -490,50 +625,52 @@ def get_break_bvps():
     base_info.loc['000625']['bvps']
 
 def main():
+    # 创建数据目录
     folder = os.path.join(os.path.dirname(__file__), 'data')
-    if os.path.exists(folder) == False:
+    if not os.path.exists(folder):
         os.mkdir(folder)
     os.chdir(folder)
 
-    obj = filter_stock(local=True)
-    # 留下来的函数都是有用的
-    # obj.count_area(writeable=True)
-    # df=obj.get_area('广东',writeable=True)
-    # obj.showInfo(df)
-    # df=obj.get_area('深圳',writeable=True)
-    # obj.showInfo(df)
-    # obj.get_all_location()
-    # obj.fetch_new_ipo(20170101,writeable=False)
-
-    # obj.drop_down_from_high('2017-01-01','300580')
-    # obj.loop_each_cixin()
-
-    # df=obj.get_all_code()
-    # result=obj.volume_calculate(df)
-    # obj.saveList(result)
-
-    # df=obj.get_chengfenggu()
-    # large,small=obj.volume_calculate(df)
-    # obj.saveList(large,'large')
-    # obj.saveList(small,'small')
-    # obj.write_to_text()
-    # obj.read_csv()
-    # obj.own_drop_down()
-    # obj.volume_calculate()
-    # obj.break_line()
-    # obj.save_data_excel()
-    # obj.break_line(mine=False,k_type='5')
-    # obj.multi_thread()
-    # code=obj.get_chengfenggu()
-    # obj.break_line(code)
-    # obj.big_deal('603918',400,'2017-04-22')
-    # obj.current_day_ticks()
-    # obj.relation()
-    # obj.profit()
-
-    # obj.mydaily_check()
-    # obj.all_stock()
-
+    # 创建选股器实例
+    stock_filter = filter_stock(local=True)
+    
+    print("\n=== 开始选股 ===")
+    
+    # 1. 基本面选股
+    print("\n1. 基于基本面数据选股...")
+    basic_stocks = stock_filter.select_by_basics(
+        pe_range=(0, 30),  # PE范围0-30
+        pb_range=(0, 3),   # PB范围0-3
+        turnover_min=3.0,  # 换手率>3%
+        volume_ratio_min=1.5  # 量比>1.5
+    )
+    print(f"基本面选股结果数量: {len(basic_stocks)}")
+    if basic_stocks:
+        df_basic = pd.DataFrame(basic_stocks, 
+                              columns=['代码', '名称', 'PE', 'PB', '换手率', '量比'])
+        df_basic.to_csv('basic_selected_stocks.csv', index=False)
+        print("基本面选股结果已保存到 basic_selected_stocks.csv")
+    
+    # 2. 技术面选股
+    print("\n2. 基于MACD策略选股...")
+    macd_stocks = stock_filter.macd()
+    print(f"MACD策略选出的股票数量: {len(macd_stocks)}")
+    if macd_stocks:
+        pd.DataFrame(macd_stocks, columns=['代码', '名称']).to_csv('macd_selected_stocks.csv', index=False)
+        print("MACD选股结果已保存到 macd_selected_stocks.csv")
+    
+    # 3. 获取上海地区的股票（可选）
+    print("\n3. 获取上海地区股票...")
+    sh_stocks = stock_filter.get_area('上海', writeable=True)
+    print(f"上海地区股票数量: {len(sh_stocks)}")
+    
+    # 4. 获取新股信息（可选）
+    print("\n4. 获取近期新股...")
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime('%Y%m%d')
+    new_stocks = stock_filter.fetch_new_ipo(start_date, writeable=True)
+    print(f"近30天新股数量: {len(new_stocks)}")
+    
+    print("\n=== 选股完成 ===")
 
 if __name__ == "__main__":
     start_time = datetime.datetime.now()
